@@ -1,0 +1,10 @@
+{
+  "id": "mindstarmap",
+  "name": "MindStarMap",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "AI-powered note organization and semantic connection for Obsidian. Automatically analyze, tag, and link your notes using DeepSeek, OpenAI, Ollama, or Xinghuo AI.",
+  "author": "MindStarMap Team",
+  "authorUrl": "https://github.com/mindstarmap",
+  "isDesktopOnly": false
+}

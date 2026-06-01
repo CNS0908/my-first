@@ -1,0 +1,122 @@
+.mindstarmap-view {
+    padding: 16px;
+    background-color: var(--background-primary);
+    color: var(--text-normal);
+}
+
+.mindstarmap-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.mindstarmap-header h3 {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0;
+    color: var(--text-normal);
+}
+
+.mindstarmap-refresh-btn {
+    padding: 6px 12px;
+    background-color: var(--interactive-accent);
+    color: var(--text-on-accent);
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.mindstarmap-refresh-btn:hover {
+    background-color: var(--interactive-accent-hover);
+}
+
+.mindstarmap-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    text-align: center;
+}
+
+.mindstarmap-empty p {
+    margin: 0 0 8px 0;
+    font-size: 14px;
+    color: var(--text-muted);
+}
+
+.mindstarmap-empty .hint {
+    font-size: 12px;
+    color: var(--text-faint);
+}
+
+.mindstarmap-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.mindstarmap-item {
+    display: flex;
+    flex-direction: column;
+    padding: 12px;
+    background-color: var(--background-secondary);
+    border-radius: 6px;
+    border: 1px solid var(--background-modifier-border);
+    transition: background-color 0.2s;
+}
+
+.mindstarmap-item:hover {
+    background-color: var(--background-secondary-alt);
+}
+
+.mindstarmap-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-normal);
+    cursor: pointer;
+    text-decoration: none;
+    margin-bottom: 4px;
+}
+
+.mindstarmap-title:hover {
+    color: var(--text-accent);
+}
+
+.mindstarmap-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+}
+
+.mindstarmap-type {
+    padding: 2px 6px;
+    background-color: var(--interactive-accent);
+    color: var(--text-on-accent);
+    border-radius: 3px;
+    font-size: 11px;
+}
+
+.mindstarmap-common {
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.theme-dark .mindstarmap-view {
+    background-color: var(--background-primary);
+}
+
+.theme-dark .mindstarmap-item {
+    background-color: var(--background-secondary);
+    border-color: var(--background-modifier-border);
+}
+
+.theme-dark .mindstarmap-item:hover {
+    background-color: var(--background-secondary-alt);
+}
