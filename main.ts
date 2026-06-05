@@ -97,6 +97,12 @@ export default class MindStarMapPlugin extends Plugin {
     
     // 启动标志：确保启动时的初始扫描只执行一次
     hasPerformedInitialScan: boolean = false;
+    
+    // ============ 防抖相关 ============
+    // 防抖计时器映射：文件路径 -> 计时器ID
+    debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+    // 防抖延迟时间（毫秒）
+    DEBOUNCE_DELAY_MS = 2000; // 2秒
 
     async onload() {
         await this.loadSettings();
@@ -194,9 +200,8 @@ export default class MindStarMapPlugin extends Plugin {
         this.registerEvent(
             this.app.vault.on('create', (file) => {
                 if (this.settings.autoOrganizeOnCreate && file instanceof TFile && file.extension === 'md') {
-                    setTimeout(() => {
-                        this.handleNoteCreateOrModify(file);
-                    }, 1000);
+                    // 使用防抖机制，2秒后执行分析
+                    this.scheduleAnalysis(file);
                 }
             })
         );
@@ -210,9 +215,8 @@ export default class MindStarMapPlugin extends Plugin {
                         this.ignoreNextModify.delete(file.path);
                         return;
                     }
-                    setTimeout(() => {
-                        this.handleNoteCreateOrModify(file);
-                    }, 2000);
+                    // 使用防抖机制，2秒后执行分析（用户停止编辑后才触发）
+                    this.scheduleAnalysis(file);
                 }
             })
         );
@@ -364,19 +368,31 @@ export default class MindStarMapPlugin extends Plugin {
                 !this.settings.excludeFolders.some(folder => f.path.startsWith(folder))
             );
 
+            // 获取源笔记标签
+            const sourceCache = this.app.metadataCache.getFileCache(file);
+            const sourceTags = sourceCache?.frontmatter?.tags || [];
+            const sourceTagsArray = Array.isArray(sourceTags) ? sourceTags : (sourceTags ? [sourceTags] : []);
+
             const relations: NoteRelation[] = [];
 
             for (const targetFile of files.slice(0, 20)) {
                 const targetContent = await this.app.vault.read(targetFile);
+                
+                // 获取目标笔记标签
+                const targetCache = this.app.metadataCache.getFileCache(targetFile);
+                const targetTags = targetCache?.frontmatter?.tags || [];
+                const targetTagsArray = Array.isArray(targetTags) ? targetTags : (targetTags ? [targetTags] : []);
 
                 try {
                     const result = await this.analyzeRelation(
                         file.path,
                         file.basename,
                         content.substring(0, 500),
+                        sourceTagsArray,
                         targetFile.path,
                         targetFile.basename,
-                        targetContent.substring(0, 500)
+                        targetContent.substring(0, 500),
+                        targetTagsArray
                     );
 
                     if (result && result.length > 0) {
@@ -419,11 +435,18 @@ export default class MindStarMapPlugin extends Plugin {
 
         const noteContents: Map<string, string> = new Map();
         const noteTitles: Map<string, string> = new Map();
+        const noteTags: Map<string, string[]> = new Map();  // 新增：存储标签
 
         for (const file of files) {
             const content = await this.app.vault.read(file);
             noteContents.set(file.path, content.substring(0, 500));
             noteTitles.set(file.path, file.basename);
+            
+            // 获取笔记标签
+            const cache = this.app.metadataCache.getFileCache(file);
+            const tags = cache?.frontmatter?.tags || [];
+            const tagsArray = Array.isArray(tags) ? tags : (tags ? [tags] : []);
+            noteTags.set(file.path, tagsArray);
         }
 
         const allRelations: RelationResponse[] = [];
@@ -439,15 +462,19 @@ export default class MindStarMapPlugin extends Plugin {
 
                     const sourceContent = noteContents.get(sourceFile.path) || '';
                     const targetContent = noteContents.get(targetFile.path) || '';
+                    const sourceTags = noteTags.get(sourceFile.path) || [];
+                    const targetTags = noteTags.get(targetFile.path) || [];
 
                     try {
                         const relations = await this.analyzeRelation(
                             sourceFile.path,
                             noteTitles.get(sourceFile.path) || '',
                             sourceContent,
+                            sourceTags,
                             targetFile.path,
                             noteTitles.get(targetFile.path) || '',
-                            targetContent
+                            targetContent,
+                            targetTags
                         );
 
                         if (relations) {
@@ -467,6 +494,30 @@ export default class MindStarMapPlugin extends Plugin {
 
         await this.applyRelations(allRelations, noteTitles);
         new Notice('MindStarMap: 文件夹关系建立完成！');
+    }
+
+    // ============ 防抖调度方法 ============
+    // 用户停止编辑并保存后，经过防抖延迟才触发分析
+    scheduleAnalysis(file: TFile) {
+        const filePath = file.path;
+        
+        // 如果存在之前的计时器，清除它（重置防抖）
+        const existingTimer = this.debounceTimers.get(filePath);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+        }
+        
+        // 创建新的计时器
+        const newTimer = setTimeout(async () => {
+            // 计时器到期，执行分析
+            await this.handleNoteCreateOrModify(file);
+            // 执行完成后移除计时器记录
+            this.debounceTimers.delete(filePath);
+        }, this.DEBOUNCE_DELAY_MS);
+        
+        // 保存计时器引用
+        this.debounceTimers.set(filePath, newTimer);
+        console.log(`[MindStarMap] 已调度分析: ${file.basename}（${this.DEBOUNCE_DELAY_MS}ms 后执行）`);
     }
 
     // ============ 新笔记单次对比（一对一分析）===========
@@ -537,7 +588,7 @@ export default class MindStarMapPlugin extends Plugin {
     }
 
     // ============ 新笔记与已有笔记的一对一关联分析 ============
-    // 将新笔记与库中所有其他笔记逐一对比，仅通过 AI 判断语义联系
+    // 将新笔记与库中所有其他笔记逐一对比，必须同时满足标签重合和语义关联才能建立链接
     async analyzeAndLinkNote(sourceFile: TFile, sourceContent: string) {
         const files = this.app.vault.getMarkdownFiles();
         const filteredFiles = files.filter(f => {
@@ -554,9 +605,23 @@ export default class MindStarMapPlugin extends Plugin {
         const sourceTitle = sourceFile.basename.replace('.md', '');
         const noteTitles: Map<string, string> = new Map();
         
+        // 收集所有笔记的标签信息
+        const noteTags: Map<string, string[]> = new Map();
+        
         for (const file of filteredFiles) {
             noteTitles.set(file.path, file.basename.replace('.md', ''));
+            
+            // 获取笔记标签
+            const cache = this.app.metadataCache.getFileCache(file);
+            const tags = cache?.frontmatter?.tags || [];
+            const tagsArray = Array.isArray(tags) ? tags : (tags ? [tags] : []);
+            noteTags.set(file.path, tagsArray);
         }
+
+        // 获取源笔记的标签
+        const sourceCache = this.app.metadataCache.getFileCache(sourceFile);
+        const sourceTags = sourceCache?.frontmatter?.tags || [];
+        const sourceTagsArray = Array.isArray(sourceTags) ? sourceTags : (sourceTags ? [sourceTags] : []);
 
         const relations: RelationResponse[] = [];
 
@@ -564,16 +629,35 @@ export default class MindStarMapPlugin extends Plugin {
         for (const targetFile of filteredFiles) {
             const targetContent = await this.app.vault.read(targetFile);
             const targetTitle = noteTitles.get(targetFile.path) || '';
+            const targetTags = noteTags.get(targetFile.path) || [];
 
+            // ============ 条件1：检查标签重合度 ============
+            // 查找相同或高度近似的标签
+            const commonTags = sourceTagsArray.filter(tag => 
+                targetTags.some(targetTag => 
+                    tag.toLowerCase() === targetTag.toLowerCase() ||
+                    targetTag.toLowerCase().includes(tag.toLowerCase()) ||
+                    tag.toLowerCase().includes(targetTag.toLowerCase())
+                )
+            );
+
+            // 如果没有标签重合，跳过该笔记对（不建立关联）
+            if (commonTags.length === 0) {
+                console.log(`[MindStarMap] 跳过 "${sourceTitle}" 与 "${targetTitle}"：无标签重合`);
+                continue;
+            }
+
+            // ============ 条件2：调用 AI 判断语义关联 ============
             try {
-                // 调用 AI 判断语义联系
                 const result = await this.analyzeRelation(
                     sourceFile.path,
                     sourceTitle,
                     sourceContent.substring(0, 500),
+                    sourceTagsArray,  // 传入源笔记标签
                     targetFile.path,
                     targetTitle,
-                    targetContent.substring(0, 500)
+                    targetContent.substring(0, 500),
+                    targetTags       // 传入目标笔记标签
                 );
 
                 if (result && result.length > 0) {
@@ -584,15 +668,15 @@ export default class MindStarMapPlugin extends Plugin {
             }
         }
 
-        // 如果没有找到任何联系，直接退出，不做任何修改
+        // 如果没有找到任何符合条件的联系，直接退出，不做任何修改
         if (relations.length === 0) {
-            console.log(`[MindStarMap] 新笔记 "${sourceTitle}" 与其他笔记无语义联系，跳过关联建立`);
+            console.log(`[MindStarMap] 新笔记 "${sourceTitle}" 未找到符合条件的关联（标签+语义双重匹配）`);
             return;
         }
 
-        // 有联系，建立关联
+        // 有符合条件的联系，建立关联
         await this.applyRelations(relations, noteTitles);
-        console.log(`[MindStarMap] 为 "${sourceTitle}" 建立了 ${relations.length} 条关联`);
+        console.log(`[MindStarMap] 为 "${sourceTitle}" 建立了 ${relations.length} 条关联（均满足标签+语义双重条件）`);
     }
 
     async aiOrganizeNote(file: TFile, showNotice: boolean = true) {
@@ -652,22 +736,30 @@ export default class MindStarMapPlugin extends Plugin {
     }
 
     async callAIForOrganization(content: string): Promise<AIResponse | null> {
-        const prompt = `分析以下笔记内容，提取关键词标签，返回 JSON 格式：
-{
-    "tags": ["标签1", "标签2", "标签3"]
-}
+        // 优化后的标签提取提示词
+        // 要求模型严格依据笔记文本的语义主题和文中明确出现的特征词生成标签
+        const prompt = `请从以下笔记内容中提取 3-5 个最核心的关键词作为标签。
+        
+要求：
+1. 标签必须直接反映文本的语义主题；
+2. 标签必须是文中出现过的特征词或紧密同义词；
+3. 禁止添加文中未提及的泛化概念或推测性标签；
+4. 标签数量限制在 3-5 个，避免过度标注；
+5. 返回格式为 JSON，示例：{"tags": ["标签1", "标签2", "标签3"]}
 
 笔记内容：
 ${content.substring(0, 2000)}
 
-请只返回 JSON，不要添加其他内容。标签应简洁且能代表笔记主题。`;
+请只返回 JSON，不要添加其他内容。`;
 
         try {
             const response = await this.makeAIRequest(prompt);
             const jsonMatch = response.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
                 const result = JSON.parse(jsonMatch[0]) as AIResponse;
-                return { tags: result.tags || [] };
+                // 确保标签数量在 3-5 个之间
+                const filteredTags = (result.tags || []).slice(0, 5);
+                return { tags: filteredTags };
             }
             return null;
         } catch (error) {
@@ -1020,45 +1112,76 @@ ${content}
         }
     }
 
+    // ============ 语义关系分析方法 ============
+    // 分析两篇笔记之间是否存在语义关联，返回 { hasRelation: boolean, type?: string, commonGround?: string }
     async analyzeRelation(
         sourcePath: string,
         sourceTitle: string,
         sourceContent: string,
+        sourceTags: string[],        // 新增：源笔记标签
         targetPath: string,
         targetTitle: string,
-        targetContent: string
+        targetContent: string,
+        targetTags: string[]         // 新增：目标笔记标签
     ): Promise<RelationResponse[] | null> {
-        const prompt = `分析以下两个笔记内容的语义关系，基于关键词和文本相似度判断，返回 JSON 数组：
-[
-    {
-        "source": "${sourceTitle}",
-        "target": "${targetTitle}",
-        "type": "补充|相反|因果|示例|相似|对比",
-        "commonGround": "共同关注的主题或关键词（简短描述）"
-    }
-]
+        // 找出共同标签用于提示词
+        const commonTags = sourceTags.filter(tag => 
+            targetTags.some(t => t.toLowerCase() === tag.toLowerCase())
+        );
 
-笔记1内容片段:
+        const prompt = `分析以下两个笔记内容是否存在语义关联。
+
+笔记1: ${sourceTitle}
+标签: ${sourceTags.join(', ') || '无'}
+内容片段:
 ${sourceContent.substring(0, 300)}
 
-笔记2内容片段:
+笔记2: ${targetTitle}
+标签: ${targetTags.join(', ') || '无'}
+内容片段:
 ${targetContent.substring(0, 300)}
 
-如果语义相似度很低或没有明显关系，返回空数组 []。只返回 JSON，不要添加其他内容。`;
+共同标签: ${commonTags.join(', ') || '无'}
+
+请判断：
+1. 两篇笔记是否存在明确的语义关联？（如补充、相反、因果、示例、主题延续等）
+2. 如果存在关联，请明确说明关系类型和共同关注点。
+
+返回格式为 JSON：
+{
+    "hasRelation": true/false,
+    "type": "关系类型（如：补充|相反|因果|示例|相似|对比|主题延续）",
+    "commonGround": "共同关注点或关联理由（简短描述）"
+}
+
+注意：
+- 只有当存在明确的语义联系时，hasRelation 才为 true
+- 如果内容无关或关联很弱，hasRelation 应为 false
+- 仅当 hasRelation 为 true 时，type 和 commonGround 字段才需要填写
+- 请严格按照 JSON 格式返回，不要添加其他内容`;
 
         try {
             const response = await this.makeAIRequest(prompt);
-            const jsonMatch = response.match(/\[[\s\S]*\]/);
+            const jsonMatch = response.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
-                const relations = JSON.parse(jsonMatch[0]) as RelationResponse[];
-                return relations.map(r => ({
-                    ...r,
-                    source: sourcePath,
-                    target: targetPath
-                }));
+                const result = JSON.parse(jsonMatch[0]);
+                
+                // 仅当 hasRelation 为 true 时才返回关联
+                if (result.hasRelation) {
+                    return [{
+                        source: sourcePath,
+                        target: targetPath,
+                        type: result.type || '关联',
+                        commonGround: result.commonGround || '语义关联'
+                    }];
+                } else {
+                    console.log(`[MindStarMap] AI 判定 "${sourceTitle}" 与 "${targetTitle}" 无语义关联`);
+                    return [];
+                }
             }
             return null;
         } catch (error) {
+            console.error('分析关系失败:', error);
             return null;
         }
     }
@@ -1140,6 +1263,11 @@ ${targetContent.substring(0, 300)}
         const file = activeView.file;
         const content = await this.app.vault.read(file);
 
+        // 获取源笔记标签
+        const sourceCache = this.app.metadataCache.getFileCache(file);
+        const sourceTags = sourceCache?.frontmatter?.tags || [];
+        const sourceTagsArray = Array.isArray(sourceTags) ? sourceTags : (sourceTags ? [sourceTags] : []);
+
         const files = this.app.vault.getMarkdownFiles();
         const filteredFiles = files.filter(f => {
             const path = f.path;
@@ -1150,15 +1278,22 @@ ${targetContent.substring(0, 300)}
 
         for (const targetFile of filteredFiles.slice(0, 10)) {
             const targetContent = await this.app.vault.read(targetFile);
+            
+            // 获取目标笔记标签
+            const targetCache = this.app.metadataCache.getFileCache(targetFile);
+            const targetTags = targetCache?.frontmatter?.tags || [];
+            const targetTagsArray = Array.isArray(targetTags) ? targetTags : (targetTags ? [targetTags] : []);
 
             try {
                 const result = await this.analyzeRelation(
                     file.path,
                     file.basename,
                     content.substring(0, 500),
+                    sourceTagsArray,
                     targetFile.path,
                     targetFile.basename,
-                    targetContent.substring(0, 500)
+                    targetContent.substring(0, 500),
+                    targetTagsArray
                 );
 
                 if (result && result.length > 0) {

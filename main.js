@@ -68,7 +68,13 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
     this.FUSE_THRESHOLD = 3;
     // 启动标志：确保启动时的初始扫描只执行一次
     this.hasPerformedInitialScan = false;
+    // ============ 防抖相关 ============
+    // 防抖计时器映射：文件路径 -> 计时器ID
+    this.debounceTimers = /* @__PURE__ */ new Map();
+    // 防抖延迟时间（毫秒）
+    this.DEBOUNCE_DELAY_MS = 2e3;
   }
+  // 2秒
   async onload() {
     await this.loadSettings();
     this.registerView(VIEW_TYPE_MINDSTARMAP, (leaf) => new MindStarMapView(leaf, this));
@@ -141,9 +147,7 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         if (this.settings.autoOrganizeOnCreate && file instanceof import_obsidian.TFile && file.extension === "md") {
-          setTimeout(() => {
-            this.handleNoteCreateOrModify(file);
-          }, 1e3);
+          this.scheduleAnalysis(file);
         }
       })
     );
@@ -155,9 +159,7 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
             this.ignoreNextModify.delete(file.path);
             return;
           }
-          setTimeout(() => {
-            this.handleNoteCreateOrModify(file);
-          }, 2e3);
+          this.scheduleAnalysis(file);
         }
       })
     );
@@ -270,23 +272,32 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
     new import_obsidian.Notice(`MindStarMap: \u7B14\u8BB0\u5206\u6790\u5B8C\u6210\uFF0C\u6210\u529F ${successCount}/${total} \u7BC7`);
   }
   async refreshNoteRelations(file) {
+    var _a, _b;
     new import_obsidian.Notice(`MindStarMap: \u6B63\u5728\u4E3A ${file.basename} \u91CD\u65B0\u5EFA\u7ACB\u5173\u7CFB...`);
     try {
       const content = await this.app.vault.read(file);
       const files = this.app.vault.getMarkdownFiles().filter(
         (f) => f.path !== file.path && !this.settings.excludeFolders.some((folder) => f.path.startsWith(folder))
       );
+      const sourceCache = this.app.metadataCache.getFileCache(file);
+      const sourceTags = ((_a = sourceCache == null ? void 0 : sourceCache.frontmatter) == null ? void 0 : _a.tags) || [];
+      const sourceTagsArray = Array.isArray(sourceTags) ? sourceTags : sourceTags ? [sourceTags] : [];
       const relations = [];
       for (const targetFile of files.slice(0, 20)) {
         const targetContent = await this.app.vault.read(targetFile);
+        const targetCache = this.app.metadataCache.getFileCache(targetFile);
+        const targetTags = ((_b = targetCache == null ? void 0 : targetCache.frontmatter) == null ? void 0 : _b.tags) || [];
+        const targetTagsArray = Array.isArray(targetTags) ? targetTags : targetTags ? [targetTags] : [];
         try {
           const result = await this.analyzeRelation(
             file.path,
             file.basename,
             content.substring(0, 500),
+            sourceTagsArray,
             targetFile.path,
             targetFile.basename,
-            targetContent.substring(0, 500)
+            targetContent.substring(0, 500),
+            targetTagsArray
           );
           if (result && result.length > 0) {
             relations.push({
@@ -309,6 +320,7 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
     }
   }
   async batchScanFolderRelations(folder) {
+    var _a;
     const folderPath = folder.path;
     const files = this.app.vault.getMarkdownFiles().filter(
       (f) => f.path.startsWith(folderPath) && !this.settings.excludeFolders.some((exclude) => f.path.startsWith(exclude))
@@ -321,10 +333,15 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
     new import_obsidian.Notice(`MindStarMap: \u6B63\u5728\u4E3A ${total} \u7BC7\u7B14\u8BB0\u5EFA\u7ACB\u5173\u7CFB...`);
     const noteContents = /* @__PURE__ */ new Map();
     const noteTitles = /* @__PURE__ */ new Map();
+    const noteTags = /* @__PURE__ */ new Map();
     for (const file of files) {
       const content = await this.app.vault.read(file);
       noteContents.set(file.path, content.substring(0, 500));
       noteTitles.set(file.path, file.basename);
+      const cache = this.app.metadataCache.getFileCache(file);
+      const tags = ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.tags) || [];
+      const tagsArray = Array.isArray(tags) ? tags : tags ? [tags] : [];
+      noteTags.set(file.path, tagsArray);
     }
     const allRelations = [];
     const batchSize = 3;
@@ -337,14 +354,18 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
             continue;
           const sourceContent = noteContents.get(sourceFile.path) || "";
           const targetContent = noteContents.get(targetFile.path) || "";
+          const sourceTags = noteTags.get(sourceFile.path) || [];
+          const targetTags = noteTags.get(targetFile.path) || [];
           try {
             const relations = await this.analyzeRelation(
               sourceFile.path,
               noteTitles.get(sourceFile.path) || "",
               sourceContent,
+              sourceTags,
               targetFile.path,
               noteTitles.get(targetFile.path) || "",
-              targetContent
+              targetContent,
+              targetTags
             );
             if (relations) {
               allRelations.push(...relations);
@@ -361,6 +382,21 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
     }
     await this.applyRelations(allRelations, noteTitles);
     new import_obsidian.Notice("MindStarMap: \u6587\u4EF6\u5939\u5173\u7CFB\u5EFA\u7ACB\u5B8C\u6210\uFF01");
+  }
+  // ============ 防抖调度方法 ============
+  // 用户停止编辑并保存后，经过防抖延迟才触发分析
+  scheduleAnalysis(file) {
+    const filePath = file.path;
+    const existingTimer = this.debounceTimers.get(filePath);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+    const newTimer = setTimeout(async () => {
+      await this.handleNoteCreateOrModify(file);
+      this.debounceTimers.delete(filePath);
+    }, this.DEBOUNCE_DELAY_MS);
+    this.debounceTimers.set(filePath, newTimer);
+    console.log(`[MindStarMap] \u5DF2\u8C03\u5EA6\u5206\u6790: ${file.basename}\uFF08${this.DEBOUNCE_DELAY_MS}ms \u540E\u6267\u884C\uFF09`);
   }
   // ============ 新笔记单次对比（一对一分析）===========
   // 当用户创建或修改笔记时触发，与库中其他笔记逐一对比
@@ -414,8 +450,9 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
     }
   }
   // ============ 新笔记与已有笔记的一对一关联分析 ============
-  // 将新笔记与库中所有其他笔记逐一对比，仅通过 AI 判断语义联系
+  // 将新笔记与库中所有其他笔记逐一对比，必须同时满足标签重合和语义关联才能建立链接
   async analyzeAndLinkNote(sourceFile, sourceContent) {
+    var _a, _b;
     const files = this.app.vault.getMarkdownFiles();
     const filteredFiles = files.filter((f) => {
       const path = f.path;
@@ -426,21 +463,43 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
     }
     const sourceTitle = sourceFile.basename.replace(".md", "");
     const noteTitles = /* @__PURE__ */ new Map();
+    const noteTags = /* @__PURE__ */ new Map();
     for (const file of filteredFiles) {
       noteTitles.set(file.path, file.basename.replace(".md", ""));
+      const cache = this.app.metadataCache.getFileCache(file);
+      const tags = ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.tags) || [];
+      const tagsArray = Array.isArray(tags) ? tags : tags ? [tags] : [];
+      noteTags.set(file.path, tagsArray);
     }
+    const sourceCache = this.app.metadataCache.getFileCache(sourceFile);
+    const sourceTags = ((_b = sourceCache == null ? void 0 : sourceCache.frontmatter) == null ? void 0 : _b.tags) || [];
+    const sourceTagsArray = Array.isArray(sourceTags) ? sourceTags : sourceTags ? [sourceTags] : [];
     const relations = [];
     for (const targetFile of filteredFiles) {
       const targetContent = await this.app.vault.read(targetFile);
       const targetTitle = noteTitles.get(targetFile.path) || "";
+      const targetTags = noteTags.get(targetFile.path) || [];
+      const commonTags = sourceTagsArray.filter(
+        (tag) => targetTags.some(
+          (targetTag) => tag.toLowerCase() === targetTag.toLowerCase() || targetTag.toLowerCase().includes(tag.toLowerCase()) || tag.toLowerCase().includes(targetTag.toLowerCase())
+        )
+      );
+      if (commonTags.length === 0) {
+        console.log(`[MindStarMap] \u8DF3\u8FC7 "${sourceTitle}" \u4E0E "${targetTitle}"\uFF1A\u65E0\u6807\u7B7E\u91CD\u5408`);
+        continue;
+      }
       try {
         const result = await this.analyzeRelation(
           sourceFile.path,
           sourceTitle,
           sourceContent.substring(0, 500),
+          sourceTagsArray,
+          // 传入源笔记标签
           targetFile.path,
           targetTitle,
-          targetContent.substring(0, 500)
+          targetContent.substring(0, 500),
+          targetTags
+          // 传入目标笔记标签
         );
         if (result && result.length > 0) {
           relations.push(...result);
@@ -450,11 +509,11 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
       }
     }
     if (relations.length === 0) {
-      console.log(`[MindStarMap] \u65B0\u7B14\u8BB0 "${sourceTitle}" \u4E0E\u5176\u4ED6\u7B14\u8BB0\u65E0\u8BED\u4E49\u8054\u7CFB\uFF0C\u8DF3\u8FC7\u5173\u8054\u5EFA\u7ACB`);
+      console.log(`[MindStarMap] \u65B0\u7B14\u8BB0 "${sourceTitle}" \u672A\u627E\u5230\u7B26\u5408\u6761\u4EF6\u7684\u5173\u8054\uFF08\u6807\u7B7E+\u8BED\u4E49\u53CC\u91CD\u5339\u914D\uFF09`);
       return;
     }
     await this.applyRelations(relations, noteTitles);
-    console.log(`[MindStarMap] \u4E3A "${sourceTitle}" \u5EFA\u7ACB\u4E86 ${relations.length} \u6761\u5173\u8054`);
+    console.log(`[MindStarMap] \u4E3A "${sourceTitle}" \u5EFA\u7ACB\u4E86 ${relations.length} \u6761\u5173\u8054\uFF08\u5747\u6EE1\u8DB3\u6807\u7B7E+\u8BED\u4E49\u53CC\u91CD\u6761\u4EF6\uFF09`);
   }
   async aiOrganizeNote(file, showNotice = true) {
     if (showNotice) {
@@ -502,21 +561,26 @@ var MindStarMapPlugin = class extends import_obsidian.Plugin {
     await this.aiOrganizeNote(file);
   }
   async callAIForOrganization(content) {
-    const prompt = `\u5206\u6790\u4EE5\u4E0B\u7B14\u8BB0\u5185\u5BB9\uFF0C\u63D0\u53D6\u5173\u952E\u8BCD\u6807\u7B7E\uFF0C\u8FD4\u56DE JSON \u683C\u5F0F\uFF1A
-{
-    "tags": ["\u6807\u7B7E1", "\u6807\u7B7E2", "\u6807\u7B7E3"]
-}
+    const prompt = `\u8BF7\u4ECE\u4EE5\u4E0B\u7B14\u8BB0\u5185\u5BB9\u4E2D\u63D0\u53D6 3-5 \u4E2A\u6700\u6838\u5FC3\u7684\u5173\u952E\u8BCD\u4F5C\u4E3A\u6807\u7B7E\u3002
+        
+\u8981\u6C42\uFF1A
+1. \u6807\u7B7E\u5FC5\u987B\u76F4\u63A5\u53CD\u6620\u6587\u672C\u7684\u8BED\u4E49\u4E3B\u9898\uFF1B
+2. \u6807\u7B7E\u5FC5\u987B\u662F\u6587\u4E2D\u51FA\u73B0\u8FC7\u7684\u7279\u5F81\u8BCD\u6216\u7D27\u5BC6\u540C\u4E49\u8BCD\uFF1B
+3. \u7981\u6B62\u6DFB\u52A0\u6587\u4E2D\u672A\u63D0\u53CA\u7684\u6CDB\u5316\u6982\u5FF5\u6216\u63A8\u6D4B\u6027\u6807\u7B7E\uFF1B
+4. \u6807\u7B7E\u6570\u91CF\u9650\u5236\u5728 3-5 \u4E2A\uFF0C\u907F\u514D\u8FC7\u5EA6\u6807\u6CE8\uFF1B
+5. \u8FD4\u56DE\u683C\u5F0F\u4E3A JSON\uFF0C\u793A\u4F8B\uFF1A{"tags": ["\u6807\u7B7E1", "\u6807\u7B7E2", "\u6807\u7B7E3"]}
 
 \u7B14\u8BB0\u5185\u5BB9\uFF1A
 ${content.substring(0, 2e3)}
 
-\u8BF7\u53EA\u8FD4\u56DE JSON\uFF0C\u4E0D\u8981\u6DFB\u52A0\u5176\u4ED6\u5185\u5BB9\u3002\u6807\u7B7E\u5E94\u7B80\u6D01\u4E14\u80FD\u4EE3\u8868\u7B14\u8BB0\u4E3B\u9898\u3002`;
+\u8BF7\u53EA\u8FD4\u56DE JSON\uFF0C\u4E0D\u8981\u6DFB\u52A0\u5176\u4ED6\u5185\u5BB9\u3002`;
     try {
       const response = await this.makeAIRequest(prompt);
       const jsonMatch = response.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const result = JSON.parse(jsonMatch[0]);
-        return { tags: result.tags || [] };
+        const filteredTags = (result.tags || []).slice(0, 5);
+        return { tags: filteredTags };
       }
       return null;
     } catch (error) {
@@ -805,37 +869,62 @@ ${content}`;
       }
     }
   }
-  async analyzeRelation(sourcePath, sourceTitle, sourceContent, targetPath, targetTitle, targetContent) {
-    const prompt = `\u5206\u6790\u4EE5\u4E0B\u4E24\u4E2A\u7B14\u8BB0\u5185\u5BB9\u7684\u8BED\u4E49\u5173\u7CFB\uFF0C\u57FA\u4E8E\u5173\u952E\u8BCD\u548C\u6587\u672C\u76F8\u4F3C\u5EA6\u5224\u65AD\uFF0C\u8FD4\u56DE JSON \u6570\u7EC4\uFF1A
-[
-    {
-        "source": "${sourceTitle}",
-        "target": "${targetTitle}",
-        "type": "\u8865\u5145|\u76F8\u53CD|\u56E0\u679C|\u793A\u4F8B|\u76F8\u4F3C|\u5BF9\u6BD4",
-        "commonGround": "\u5171\u540C\u5173\u6CE8\u7684\u4E3B\u9898\u6216\u5173\u952E\u8BCD\uFF08\u7B80\u77ED\u63CF\u8FF0\uFF09"
-    }
-]
+  // ============ 语义关系分析方法 ============
+  // 分析两篇笔记之间是否存在语义关联，返回 { hasRelation: boolean, type?: string, commonGround?: string }
+  async analyzeRelation(sourcePath, sourceTitle, sourceContent, sourceTags, targetPath, targetTitle, targetContent, targetTags) {
+    const commonTags = sourceTags.filter(
+      (tag) => targetTags.some((t) => t.toLowerCase() === tag.toLowerCase())
+    );
+    const prompt = `\u5206\u6790\u4EE5\u4E0B\u4E24\u4E2A\u7B14\u8BB0\u5185\u5BB9\u662F\u5426\u5B58\u5728\u8BED\u4E49\u5173\u8054\u3002
 
-\u7B14\u8BB01\u5185\u5BB9\u7247\u6BB5:
+\u7B14\u8BB01: ${sourceTitle}
+\u6807\u7B7E: ${sourceTags.join(", ") || "\u65E0"}
+\u5185\u5BB9\u7247\u6BB5:
 ${sourceContent.substring(0, 300)}
 
-\u7B14\u8BB02\u5185\u5BB9\u7247\u6BB5:
+\u7B14\u8BB02: ${targetTitle}
+\u6807\u7B7E: ${targetTags.join(", ") || "\u65E0"}
+\u5185\u5BB9\u7247\u6BB5:
 ${targetContent.substring(0, 300)}
 
-\u5982\u679C\u8BED\u4E49\u76F8\u4F3C\u5EA6\u5F88\u4F4E\u6216\u6CA1\u6709\u660E\u663E\u5173\u7CFB\uFF0C\u8FD4\u56DE\u7A7A\u6570\u7EC4 []\u3002\u53EA\u8FD4\u56DE JSON\uFF0C\u4E0D\u8981\u6DFB\u52A0\u5176\u4ED6\u5185\u5BB9\u3002`;
+\u5171\u540C\u6807\u7B7E: ${commonTags.join(", ") || "\u65E0"}
+
+\u8BF7\u5224\u65AD\uFF1A
+1. \u4E24\u7BC7\u7B14\u8BB0\u662F\u5426\u5B58\u5728\u660E\u786E\u7684\u8BED\u4E49\u5173\u8054\uFF1F\uFF08\u5982\u8865\u5145\u3001\u76F8\u53CD\u3001\u56E0\u679C\u3001\u793A\u4F8B\u3001\u4E3B\u9898\u5EF6\u7EED\u7B49\uFF09
+2. \u5982\u679C\u5B58\u5728\u5173\u8054\uFF0C\u8BF7\u660E\u786E\u8BF4\u660E\u5173\u7CFB\u7C7B\u578B\u548C\u5171\u540C\u5173\u6CE8\u70B9\u3002
+
+\u8FD4\u56DE\u683C\u5F0F\u4E3A JSON\uFF1A
+{
+    "hasRelation": true/false,
+    "type": "\u5173\u7CFB\u7C7B\u578B\uFF08\u5982\uFF1A\u8865\u5145|\u76F8\u53CD|\u56E0\u679C|\u793A\u4F8B|\u76F8\u4F3C|\u5BF9\u6BD4|\u4E3B\u9898\u5EF6\u7EED\uFF09",
+    "commonGround": "\u5171\u540C\u5173\u6CE8\u70B9\u6216\u5173\u8054\u7406\u7531\uFF08\u7B80\u77ED\u63CF\u8FF0\uFF09"
+}
+
+\u6CE8\u610F\uFF1A
+- \u53EA\u6709\u5F53\u5B58\u5728\u660E\u786E\u7684\u8BED\u4E49\u8054\u7CFB\u65F6\uFF0ChasRelation \u624D\u4E3A true
+- \u5982\u679C\u5185\u5BB9\u65E0\u5173\u6216\u5173\u8054\u5F88\u5F31\uFF0ChasRelation \u5E94\u4E3A false
+- \u4EC5\u5F53 hasRelation \u4E3A true \u65F6\uFF0Ctype \u548C commonGround \u5B57\u6BB5\u624D\u9700\u8981\u586B\u5199
+- \u8BF7\u4E25\u683C\u6309\u7167 JSON \u683C\u5F0F\u8FD4\u56DE\uFF0C\u4E0D\u8981\u6DFB\u52A0\u5176\u4ED6\u5185\u5BB9`;
     try {
       const response = await this.makeAIRequest(prompt);
-      const jsonMatch = response.match(/\[[\s\S]*\]/);
+      const jsonMatch = response.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
-        const relations = JSON.parse(jsonMatch[0]);
-        return relations.map((r) => ({
-          ...r,
-          source: sourcePath,
-          target: targetPath
-        }));
+        const result = JSON.parse(jsonMatch[0]);
+        if (result.hasRelation) {
+          return [{
+            source: sourcePath,
+            target: targetPath,
+            type: result.type || "\u5173\u8054",
+            commonGround: result.commonGround || "\u8BED\u4E49\u5173\u8054"
+          }];
+        } else {
+          console.log(`[MindStarMap] AI \u5224\u5B9A "${sourceTitle}" \u4E0E "${targetTitle}" \u65E0\u8BED\u4E49\u5173\u8054`);
+          return [];
+        }
       }
       return null;
     } catch (error) {
+      console.error("\u5206\u6790\u5173\u7CFB\u5931\u8D25:", error);
       return null;
     }
   }
@@ -899,6 +988,7 @@ ${links}
     }
   }
   async refreshCurrentNoteRelations() {
+    var _a, _b;
     const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
     if (!activeView || !activeView.file) {
       new import_obsidian.Notice("\u8BF7\u5148\u6253\u5F00\u4E00\u4E2A\u7B14\u8BB0");
@@ -907,6 +997,9 @@ ${links}
     new import_obsidian.Notice("\u6B63\u5728\u5237\u65B0\u5173\u8054...");
     const file = activeView.file;
     const content = await this.app.vault.read(file);
+    const sourceCache = this.app.metadataCache.getFileCache(file);
+    const sourceTags = ((_a = sourceCache == null ? void 0 : sourceCache.frontmatter) == null ? void 0 : _a.tags) || [];
+    const sourceTagsArray = Array.isArray(sourceTags) ? sourceTags : sourceTags ? [sourceTags] : [];
     const files = this.app.vault.getMarkdownFiles();
     const filteredFiles = files.filter((f) => {
       const path = f.path;
@@ -915,14 +1008,19 @@ ${links}
     const relations = [];
     for (const targetFile of filteredFiles.slice(0, 10)) {
       const targetContent = await this.app.vault.read(targetFile);
+      const targetCache = this.app.metadataCache.getFileCache(targetFile);
+      const targetTags = ((_b = targetCache == null ? void 0 : targetCache.frontmatter) == null ? void 0 : _b.tags) || [];
+      const targetTagsArray = Array.isArray(targetTags) ? targetTags : targetTags ? [targetTags] : [];
       try {
         const result = await this.analyzeRelation(
           file.path,
           file.basename,
           content.substring(0, 500),
+          sourceTagsArray,
           targetFile.path,
           targetFile.basename,
-          targetContent.substring(0, 500)
+          targetContent.substring(0, 500),
+          targetTagsArray
         );
         if (result && result.length > 0) {
           relations.push({
